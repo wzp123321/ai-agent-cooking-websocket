@@ -1,0 +1,67 @@
+{
+  "name": "cooking-app",
+  "version": "1.0.0",
+  "description": "🍳 厨神小助 — AI 烹饪智能体对话界面，Vue3 + Vite + Pinia + Element Plus，支持 SSE 流式对话、Markdown 渲染、多轮历史、用户画像、响应式布局",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc && vite build",
+    "preview": "vite preview",
+    "type-check": "vue-tsc --noEmit"
+  },
+  "keywords": [
+    "vue3",
+    "vite",
+    "pinia",
+    "element-plus",
+    "ai-chat",
+    "cooking",
+    "sse",
+    "streaming",
+    "chatbot",
+    "markdown",
+    "typescript",
+    "responsive",
+    "spa",
+    "recipe",
+    "food",
+    "culinary",
+    "chinese-cuisine",
+    "智能体",
+    "烹饪",
+    "菜谱",
+    "美食",
+    "对话"
+  ],
+  "author": {
+    "name": "cooking-ai",
+    "url": "https://github.com/cooking-ai"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cooking-ai/cooking-ai"
+  },
+  "homepage": "https://github.com/cooking-ai/cooking-ai#readme",
+  "bugs": {
+    "url": "https://github.com/cooking-ai/cooking-ai/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.1",
+    "axios": "^1.16.1",
+    "element-plus": "^2.7.2",
+    "marked": "^12.0.0",
+    "pinia": "^2.1.7",
+    "vue": "^3.4.21",
+    "vue-router": "^4.3.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.4",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.0",
+    "vue-tsc": "^2.0.13"
+  }
+}
