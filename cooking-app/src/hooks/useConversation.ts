@@ -27,23 +27,23 @@ import type { ChatMessage } from '@/types'
  */
 const STREAM_TIMEOUT_MS = 60_000
 
-function genId(): string {
+const genId = (): string => {
   return `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 }
 
-export function useConversation() {
+export const useConversation = () => {
   const store = useChatStore()
   let abortController: AbortController | null = null
   let streamTimer: ReturnType<typeof setTimeout> | null = null
 
-  function clearStreamTimer(): void {
+  const clearStreamTimer = (): void => {
     if (streamTimer !== null) {
       clearTimeout(streamTimer)
       streamTimer = null
     }
   }
 
-  function abort(): void {
+  const abort = (): void => {
     clearStreamTimer()
     if (abortController) {
       abortController.abort()
@@ -51,7 +51,7 @@ export function useConversation() {
     }
   }
 
-  function stopGeneration(): void {
+  const stopGeneration = (): void => {
     if (!abortController) return
 
     console.info('[Conversation] 🛑 用户手动中止生成')
@@ -80,7 +80,7 @@ export function useConversation() {
     }
   }
 
-  async function sendMessage(content: string): Promise<void> {
+  const sendMessage = async (content: string): Promise<void> => {
     if (store.loading) {
       console.warn('[Conversation] ⚠️ 正在发送中，忽略重复请求')
       return
@@ -201,7 +201,7 @@ export function useConversation() {
     }
   }
 
-  async function sendVisionMessage(imageBase64: string, text?: string): Promise<void> {
+  const sendVisionMessage = async (imageBase64: string, text?: string): Promise<void> => {
     if (store.loading) {
       console.warn('[Conversation] ⚠️ 正在发送中，忽略重复请求')
       return

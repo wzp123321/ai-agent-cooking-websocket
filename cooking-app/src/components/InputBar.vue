@@ -129,11 +129,11 @@ const canSend = computed(
   () => hasContent.value && !chatStore.loading && chatStore.agentOnline,
 );
 
-function triggerFileInput() {
+const triggerFileInput = () => {
   fileInputRef.value?.click()
 }
 
-function handleFileChange(e: Event) {
+const handleFileChange = (e: Event) => {
   const input = e.target as HTMLInputElement
   const file = input.files?.[0]
   if (!file) return
@@ -157,29 +157,29 @@ function handleFileChange(e: Event) {
   input.value = ''
 }
 
-function removeImage() {
+const removeImage = () => {
   selectedImage.value = ""
 }
 
-function getImageBase64(): string | null {
+const getImageBase64 = (): string | null => {
   if (!selectedImage.value) return null
   const parts = selectedImage.value.split(',')
   if (parts.length === 2) return parts[1]
   return selectedImage.value
 }
 
-function handleKeydown(e: KeyboardEvent) {
+const handleKeydown = (e: KeyboardEvent) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     handleSend();
   }
 }
 
-function handleStop() {
+const handleStop = () => {
   stopGeneration()
 }
 
-async function handleSend() {
+const handleSend = async () => {
   if (!canSend.value) return;
 
   const text = inputText.value.trim();

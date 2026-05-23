@@ -12,7 +12,7 @@ COPY dist/ ./dist/
 
 RUN mkdir -p /app/data
 
-EXPOSE 9000
+EXPOSE 9002
 
 ENV NODE_ENV=production
 

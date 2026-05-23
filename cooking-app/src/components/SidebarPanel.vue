@@ -129,20 +129,20 @@ useHealthCheck()
 // ── 事件处理 ──────────────────────────────────────────────
 
 /** 新建对话 */
-function handleNewChat() {
+const handleNewChat = () => {
   chatStore.newSession()
   emit('close')
 }
 
 /** 切换会话并加载历史 */
-function handleSwitchSession(id: string) {
+const handleSwitchSession = (id: string) => {
   chatStore.switchSession(id)
   chatStore.loadHistory(id)
   emit('close')
 }
 
 /** 删除指定会话 */
-async function handleDeleteSession(id: string) {
+const handleDeleteSession = async (id: string) => {
   await ElMessageBox.confirm(
     '确定要删除这条对话吗？删除后无法恢复。',
     '提示',
@@ -156,7 +156,7 @@ async function handleDeleteSession(id: string) {
 }
 
 /** 点击快捷问题，直接作为首条消息发送 */
-function handleQuickQuestion(q: string) {
+const handleQuickQuestion = (q: string) => {
   sendMessage(q)
   emit('close')
 }

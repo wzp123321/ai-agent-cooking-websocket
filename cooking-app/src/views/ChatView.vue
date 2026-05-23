@@ -124,7 +124,7 @@ onUnmounted(() => {
 const drawerOpen = ref(false)
 const profileOpen = ref(false)
 
-function handleGlobalKeydown(e: KeyboardEvent) {
+const handleGlobalKeydown = (e: KeyboardEvent) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'n') {
     e.preventDefault()
     chatStore.newSession()
@@ -139,7 +139,7 @@ function handleGlobalKeydown(e: KeyboardEvent) {
  *   2. 弹出 Element Plus 确认框
  *   3. 用户确认后，调用 Store 的 clearCurrentSession action
  */
-async function handleClear() {
+const handleClear = async () => {
   if (chatStore.messages.length === 0) return
 
   await ElMessageBox.confirm(

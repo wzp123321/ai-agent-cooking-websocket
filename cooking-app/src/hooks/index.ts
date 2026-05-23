@@ -1,3 +1,5 @@
 export { useHealthCheck } from './useHealthCheck'
 export { useScrollToBottom } from './useScrollToBottom'
 export { useConversation } from './useConversation'
+export { useWebSocket } from './useWebSocket'
+export { useStream } from './useStream'

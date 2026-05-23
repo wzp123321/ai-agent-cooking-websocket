@@ -7,17 +7,17 @@ services:
       dockerfile: Dockerfile
     container_name: cooking-agent
     ports:
-      - "${AGENT_PORT:-9000}:9000"
+      - "${AGENT_PORT:-9002}:9002"
     environment:
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
-      - PORT=9000
+      - PORT=9002
       - NODE_ENV=production
     volumes:
       - agent_data:/app/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:9000/health',r=>{process.exit(r.statusCode===200?0:1)})"]
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:9002/health',r=>{process.exit(r.statusCode===200?0:1)})"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -45,12 +45,12 @@ interface RequestMeta {
 // ─── 工具函数 ────────────────────────────────────────────
 
 /** 生成唯一请求 ID（时间戳 + 随机串） */
-function genRequestId(): string {
+const genRequestId = (): string => {
   return `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 }
 
 /** 计算请求耗时（毫秒） */
-function calcDuration(startTime: number): number {
+const calcDuration = (startTime: number): number => {
   return Date.now() - startTime
 }
 

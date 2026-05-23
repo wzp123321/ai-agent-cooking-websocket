@@ -59,7 +59,7 @@ const renderedContent = ref<string>('')
 let parseTimer: ReturnType<typeof setTimeout> | null = null
 let lastParsedLength = 0
 
-function parseMarkdown() {
+const parseMarkdown = () => {
   const text = props.message.content
   if (!text) {
     renderedContent.value = ''

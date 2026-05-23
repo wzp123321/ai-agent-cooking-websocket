@@ -165,7 +165,7 @@ onMounted(async () => {
   }
 })
 
-function addAllergy() {
+const addAllergy = () => {
   const val = allergyInput.value.trim()
   if (val && !form.allergies.includes(val)) {
     form.allergies.push(val)
@@ -173,11 +173,11 @@ function addAllergy() {
   allergyInput.value = ''
 }
 
-function removeAllergy(i: number) {
+const removeAllergy = (i: number) => {
   form.allergies.splice(i, 1)
 }
 
-function addDisliked() {
+const addDisliked = () => {
   const val = dislikeInput.value.trim()
   if (val && !form.disliked.includes(val)) {
     form.disliked.push(val)
@@ -185,11 +185,11 @@ function addDisliked() {
   dislikeInput.value = ''
 }
 
-function removeDisliked(i: number) {
+const removeDisliked = (i: number) => {
   form.disliked.splice(i, 1)
 }
 
-async function save() {
+const save = async () => {
   saving.value = true
   try {
     const profile = await updateProfile({

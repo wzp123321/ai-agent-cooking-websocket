@@ -20,11 +20,11 @@ import type { ChatMessage, ChatSession, SessionMeta } from '@/types'
 
 // ─── 工具函数 ──────────────────────────────────────────────
 
-function genId(): string {
+const genId = (): string => {
   return `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 }
 
-function createSession(): ChatSession {
+const createSession = (): ChatSession => {
   const id = genId()
   return {
     id,
@@ -35,7 +35,7 @@ function createSession(): ChatSession {
   }
 }
 
-function metaToSession(meta: SessionMeta): ChatSession {
+const metaToSession = (meta: SessionMeta): ChatSession => {
   return {
     id: meta.id,
     title: meta.title,
@@ -74,20 +74,20 @@ export const useChatStore = defineStore('chat', () => {
   // Actions — 会话管理
   // ══════════════════════════════════════════════════════════
 
-  function newSession(): void {
+  const newSession = (): void => {
     const s = createSession()
     sessions.value.unshift(s)
     currentSessionId.value = s.id
     console.info(`[Store] 🆕 新建会话：${s.id}`)
   }
 
-  function switchSession(id: string): void {
+  const switchSession = (id: string): void => {
     if (id === currentSessionId.value) return
     console.info(`[Store] 🔄 切换会话：${currentSessionId.value} → ${id}`)
     currentSessionId.value = id
   }
 
-  async function deleteSession(id: string): Promise<void> {
+  const deleteSession = async (id: string): Promise<void> => {
     console.info(`[Store] 🗑️ 删除会话：${id}`)
     await clearSession(id).catch(() => {})
 
@@ -100,7 +100,7 @@ export const useChatStore = defineStore('chat', () => {
     if (sessions.value.length === 0) newSession()
   }
 
-  async function clearCurrentSession(): Promise<void> {
+  const clearCurrentSession = async (): Promise<void> => {
     const session = currentSession.value
     console.info(`[Store] 🧹 清空会话消息：${session.id}`)
     await clearSession(session.id).catch(() => {})
@@ -113,7 +113,7 @@ export const useChatStore = defineStore('chat', () => {
   // Actions — 后端同步
   // ══════════════════════════════════════════════════════════
 
-  async function loadSessions(): Promise<void> {
+  const loadSessions = async (): Promise<void> => {
     try {
       const metas = await getSessions()
       if (metas.length === 0) {
@@ -130,7 +130,7 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  async function loadHistory(sessionId: string): Promise<void> {
+  const loadHistory = async (sessionId: string): Promise<void> => {
     const session = sessions.value.find((s) => s.id === sessionId)
     if (!session) return
     if (session.messages.length > 0) return // 已加载过
@@ -148,7 +148,7 @@ export const useChatStore = defineStore('chat', () => {
   // Actions — 健康检查
   // ══════════════════════════════════════════════════════════
 
-  async function checkHealth(): Promise<void> {
+  const checkHealth = async (): Promise<void> => {
     agentOnline.value = await healthCheck()
   }
 

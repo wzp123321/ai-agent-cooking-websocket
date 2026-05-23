@@ -13,11 +13,12 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:9000',
+        target: 'http://localhost:9002',
         changeOrigin: true,
+        ws: true, // 支持 WebSocket 代理
       },
       '/health': {
-        target: 'http://localhost:9000',
+        target: 'http://localhost:9002',
         changeOrigin: true,
       },
     },

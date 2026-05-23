@@ -95,7 +95,7 @@ import cors from 'cors'
 import 'dotenv/config'
 
 const app = express()
-const PORT = Number(process.env.PORT) || 9000
+const PORT = Number(process.env.PORT) || 9002
 
 // 中间件
 app.use(cors())
@@ -589,7 +589,7 @@ try {
 # .env（不提交到 Git）
 DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxx
 DEEPSEEK_BASE_URL=https://api.deepseek.com
-PORT=9000
+PORT=9002
 ```
 
 ### 12.2 加载方式
@@ -600,7 +600,7 @@ import 'dotenv/config'
 
 // 使用
 const apiKey = process.env.DEEPSEEK_API_KEY
-const port = Number(process.env.PORT) || 9000
+const port = Number(process.env.PORT) || 9002
 ```
 
 ### 12.3 关键注意事项
@@ -662,7 +662,7 @@ dist/
 ### 启动阶段
 
 - [ ] `.env` 文件存在且包含必填的 `DEEPSEEK_API_KEY`
-- [ ] 端口未被占用（`netstat -ano | findstr :9000`）
+- [ ] 端口未被占用（`netstat -ano | findstr :9002`）
 - [ ] `data/` 目录有写入权限
 - [ ] 数据库迁移在 `app.listen()` 之前执行
 

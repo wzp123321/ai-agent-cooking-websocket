@@ -4,21 +4,23 @@
  * ============================================================
  *
  * 功能概述：
- *   封装与 cooking-agent 后端服务的 HTTP 通信，包括：
+ *   封装与 cooking-agent 后端服务的 HTTP/WebSocket 通信，包括：
  *   - 普通对话（完整返回）
- *   - 流式对话（SSE，逐字接收）
+ *   - 流式对话（WebSocket，逐字接收）
  *   - 会话管理（列表、历史、清除）
  *   - 健康检查
  *   - 用户画像（获取、更新）
  *
  * 技术选型：
  *   - REST 接口：使用 Axios 实例（统一拦截器、错误处理、日志）
- *   - SSE 流式：使用原生 fetch（Axios 不支持 ReadableStream）
- *   - BASE_URL 由 Vite 代理到 http://localhost:9000（见 vite.config.js）
+ *   - WebSocket 流式：使用原生 WebSocket API
+ *   - BASE_URL 由 Vite 代理到 http://localhost:9002（见 vite.config.js）
  *
- * 错误处理：
- *   - Axios 响应拦截器统一处理 HTTP 错误并弹出提示
- *   - SSE 解析失败行直接跳过，不中断后续处理
+ * WebSocket 特性：
+ *   - 自动重连（指数退避策略，最大延迟 30 秒）
+ *   - 心跳检测（响应服务端 ping）
+ *   - 消息确认（ACK）机制
+ *   - 连接状态管理
  */
 
 import request from './request'
@@ -27,17 +29,6 @@ import type { ChatResponse, SessionMeta, ChatMessage, UserProfile } from '@/type
 
 // ─── 普通对话 ──────────────────────────────────────────────
 
-/**
- * 发送普通对话请求（非流式，一次性返回完整结果）
- *
- * 使用场景：
- *   - 简单快速问答
- *   - 调试/测试接口
- *
- * @param message   - 用户输入的消息
- * @param sessionId - 会话 ID（默认 'default'）
- * @returns 包含 AI 回复的结构化对象
- */
 export async function sendChat(message: string, sessionId: string): Promise<ChatResponse> {
   console.info(`[API] POST /chat [${sessionId}]`)
 
@@ -47,18 +38,36 @@ export async function sendChat(message: string, sessionId: string): Promise<Chat
   return data
 }
 
-// ─── 流式对话（SSE，保留原生 fetch）───────────────────────
+// ─── 流式对话（WebSocket）─────────────────────────────────
+
+interface WebSocketMessage {
+  type: 'chunk' | 'done' | 'error' | 'ping' | 'pong' | 'ack' | 'welcome'
+  content?: string
+  sessionId?: string
+  error?: string
+  messageId?: string
+  message?: string
+}
 
 /**
- * 发送流式对话请求（SSE — Server-Sent Events）
+ * 生成唯一消息 ID
+ */
+const generateMessageId = (): string => {
+  return `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`
+}
+
+/**
+ * 发送流式对话请求（WebSocket）
  *
- * 注意：此函数使用原生 fetch 而非 Axios，
- * 因为 Axios 不支持 ReadableStream 流式读取。
- *
- * SSE 事件类型：
- *   - 'chunk'：每个 token 片段到达时触发 → 调用 onChunk
- *   - 'done' ：全部传输结束时触发 → 调用 onDone
- *   - 'error'：后端出错时触发 → 调用 onError
+ * WebSocket 消息格式：
+ *   客户端发送：{ "type": "chat", "message": "...", "sessionId": "...", "messageId": "..." }
+ *   客户端发送：{ "type": "pong" } - 心跳响应
+ *   服务端发送：{ "type": "chunk", "content": "..." }
+ *   服务端发送：{ "type": "done", "content": "...", "sessionId": "..." }
+ *   服务端发送：{ "type": "error", "error": "..." }
+ *   服务端发送：{ "type": "ping" } - 心跳检测
+ *   服务端发送：{ "type": "ack", "messageId": "..." } - 消息确认
+ *   服务端发送：{ "type": "welcome", "message": "..." } - 连接成功
  *
  * @param message   - 用户输入
  * @param sessionId - 会话 ID
@@ -75,125 +84,210 @@ export async function sendChatStream(
   onError: (err: Error) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  console.info(`[API] POST /chat/stream [${sessionId}] 建立 SSE 连接…`)
+  console.info(`[API] WebSocket /chat/ws [${sessionId}] 建立连接…`)
 
-  let response: Response
+  // 构建 WebSocket URL（将 http/https 转换为 ws/wss）
+  const baseUrl = BASE_URL.startsWith('/') 
+    ? window.location.origin + BASE_URL 
+    : BASE_URL
+  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const wsUrl = `${wsProtocol}//${baseUrl.replace(/^https?:\/\//, '')}/chat/ws`
 
-  try {
-    response = await fetch(`${BASE_URL}/chat/stream`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, sessionId }),
-      signal,
-    })
-  } catch (err) {
+  // 生成消息 ID（用于 ACK 确认）
+  const messageId = generateMessageId()
+
+  return new Promise<void>((resolve, reject) => {
+    let ws: WebSocket | null = null
+    let fullContent = ''
+    let closed = false
+    let reconnectionAttempts = 0
+    const MAX_RECONNECT_ATTEMPTS = 5
+    const INITIAL_RECONNECT_DELAY = 1000
+    const MAX_RECONNECT_DELAY = 30000
+    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null
+
     /**
-     * AbortError 不是真正的网络错误，而是用户主动中止或超时的预期行为。
-     * 必须调用 onError 回调，确保上层的 sendMessage 能够正确清理
-     * loading 状态、streaming 标记和 AbortController 引用。
+     * 生成重连延迟（指数退避）
      */
-    if ((err as Error).name === 'AbortError') {
-      console.info(`[API] 🛑 SSE [${sessionId}] 请求已取消`)
-      onError(err as Error)
-      return
+    const getReconnectDelay = (attempt: number): number => {
+      const delay = INITIAL_RECONNECT_DELAY * Math.pow(2, attempt)
+      // 添加随机抖动避免雪崩
+      const jitter = delay * 0.1 * (Math.random() * 2 - 1)
+      return Math.min(delay + jitter, MAX_RECONNECT_DELAY)
     }
+
     /**
-     * 真正的网络异常：
-     *   - Agent 进程崩溃（ECONNREFUSED）
-     *   - DNS 解析失败
-     *   - 网络超时
-     *   - TLS 握手失败
+     * 创建新的 WebSocket 连接
      */
-    console.error('[API] ❌ /chat/stream 网络请求失败：', err)
-    onError(err as Error)
-    return
-  }
+    const createConnection = () => {
+      if (closed) return
 
-  if (!response.ok) {
-    console.error(`[API] ❌ /chat/stream HTTP ${response.status}`)
-    onError(new Error(`HTTP ${response.status}`))
-    return
-  }
+      ws = new WebSocket(wsUrl)
 
-  console.info('[API] 🔗 SSE 连接已建立，开始接收流…')
+      /**
+       * WebSocket 连接建立成功
+       */
+      ws.onopen = () => {
+        console.info('[API] 🔗 WebSocket 连接已建立')
+        reconnectionAttempts = 0 // 重置重连计数
 
-  const reader = response.body!.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-
-  /**
-   * try-catch 包裹整个 read 循环，处理 Agent 进程崩溃导致的 TCP RST：
-   *
-   * 当 Express 进程被 kill 时，已建立的 TCP 连接被操作系统强制 RST，
-   * reader.read() 会抛出 TypeError 或 AbortError。如果不捕获，
-   * 异常会冒泡到 sendMessage 的外层 catch，用户看到的是原始错误信息
-   * 而非友好的 "Agent 连接中断" 提示。
-   */
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-
-      if (done) {
-        console.info('[API] ✅ SSE 流读取完毕')
-        break
+        // 发送聊天消息
+        const payload = JSON.stringify({
+          type: 'chat',
+          message,
+          sessionId,
+          messageId,
+        })
+        ws!.send(payload)
+        console.info(`[API] 📤 发送消息 [${sessionId}]，消息ID: ${messageId}`)
       }
 
       /**
-       * TextDecoder.decode(value, { stream: true }) 的关键参数 stream: true：
-       * 多字节字符（如中文 UTF-8 编码的 3 字节字符）可能跨 chunk 边界被截断，
-       * stream: true 让 TextDecoder 缓存不完整的多字节序列，等待下一个 chunk 拼接。
-       * 省略此参数会导致乱码。
+       * 接收 WebSocket 消息
        */
-      buffer += decoder.decode(value, { stream: true })
+      ws.onmessage = (event) => {
+        let data: WebSocketMessage
 
-      /**
-       * buffer 机制防止 SSE 行被 chunk 边界截断：
-       *   - split('\n') 分割后，最后一行可能不完整
-       *   - lines.pop() 保留最后一行到 buffer，等待下一个 chunk 拼接
-       *   - 只有完整的行（以 \n 结尾）才进入解析循环
-       */
-      const lines = buffer.split('\n')
-      buffer = lines.pop() ?? ''
+        try {
+          data = JSON.parse(event.data)
+        } catch (err) {
+          console.warn('[API] ⚠️ WebSocket 消息解析失败：', event.data.slice(0, 50))
+          return
+        }
 
-      for (const line of lines) {
-        if (!line.trim()) continue
+        switch (data.type) {
+          case 'ping':
+            // 响应心跳
+            ws!.send(JSON.stringify({ type: 'pong' }))
+            console.debug('[API] 🏓 响应 ping')
+            break
 
-        if (line.startsWith('data: ')) {
-          const jsonStr = line.slice(6).trim()
-          if (!jsonStr) continue
+          case 'welcome':
+            console.info('[API] 👋 收到欢迎消息：', data.message)
+            break
 
-          try {
-            const data = JSON.parse(jsonStr) as Record<string, unknown>
+          case 'ack':
+            console.info(`[API] ✅ 消息已确认 (${data.messageId})`)
+            break
 
-            if (typeof data['content'] === 'string' && !('sessionId' in data)) {
-              onChunk(data['content'] as string)
-            } else if (typeof data['sessionId'] === 'string') {
-              console.info(`[API] ✅ SSE done [${data['sessionId']}] 传输完成`)
-              onDone(data['content'] as string)
-            } else if (typeof data['error'] === 'string') {
-              console.error('[API] ❌ SSE error 事件：', data['error'])
-              onError(new Error(data['error'] as string))
+          case 'chunk':
+            if (typeof data.content === 'string') {
+              fullContent += data.content
+              onChunk(data.content)
             }
-          } catch {
-            console.warn('[API] ⚠️  SSE 行解析失败，跳过：', jsonStr.slice(0, 50))
-          }
+            break
+
+          case 'done':
+            console.info(`[API] ✅ WebSocket [${sessionId}] 传输完成`)
+            cleanupAndClose()
+            onDone(data.content || fullContent)
+            resolve()
+            break
+
+          case 'error':
+            console.error('[API] ❌ WebSocket error 事件：', data.error)
+            cleanupAndClose()
+            onError(new Error(data.error || 'WebSocket error'))
+            reject(new Error(data.error || 'WebSocket error'))
+            break
+
+          default:
+            console.warn('[API] ⚠️ 未知消息类型：', data.type)
         }
       }
+
+      /**
+       * WebSocket 连接关闭
+       */
+      ws.onclose = (event) => {
+        if (closed) return
+        console.info(`[API] 🔌 WebSocket 连接关闭 (${event.code}): ${event.reason}`)
+
+        // 检查是否需要重连
+        if (!closed && 
+            reconnectionAttempts < MAX_RECONNECT_ATTEMPTS && 
+            event.code !== 1000 && // 非预期关闭
+            event.code !== 1001 && // 客户端主动断开
+            !signal?.aborted) {
+          
+          const delay = getReconnectDelay(reconnectionAttempts)
+          reconnectionAttempts++
+          
+          console.warn(`[API] ⚠️ 尝试重连 (${reconnectionAttempts}/${MAX_RECONNECT_ATTEMPTS})，延迟 ${Math.round(delay)}ms`)
+          
+          reconnectTimeout = setTimeout(() => {
+            console.info('[API] 🔄 尝试重新连接...')
+            createConnection()
+          }, delay)
+          return
+        }
+
+        // 最终关闭
+        closed = true
+        if (event.code !== 1000 && !signal?.aborted) {
+          const errorMsg = event.code === 1011 
+            ? event.reason 
+            : reconnectionAttempts >= MAX_RECONNECT_ATTEMPTS
+              ? '重连失败，请检查网络或后端服务'
+              : 'Agent 连接中断'
+          onError(new Error(errorMsg))
+          reject(new Error(errorMsg))
+        }
+      }
+
+      /**
+       * WebSocket 错误处理
+       */
+      ws.onerror = (event) => {
+        if (closed) return
+
+        console.error('[API] ❌ WebSocket 错误：', event)
+        
+        // 错误发生后会触发 onclose，由 onclose 处理重连逻辑
+      }
     }
-  } catch (err) {
-    console.error('[API] ❌ SSE 连接中断（Agent 可能已崩溃）：', err)
-    onError(new Error('Agent 连接中断，请检查后端服务是否正常运行'))
-  }
+
+    /**
+     * 清理资源并关闭连接
+     */
+    const cleanupAndClose = () => {
+      if (closed) return
+      closed = true
+
+      // 清除重连定时器
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout)
+        reconnectTimeout = null
+      }
+
+      // 关闭 WebSocket
+      if (ws) {
+        try {
+          ws.close(1000, 'Normal close')
+        } catch {
+          // 忽略关闭错误
+        }
+        ws = null
+      }
+    }
+
+    /**
+     * 处理中止信号
+     */
+    signal?.addEventListener('abort', () => {
+      console.info(`[API] 🛑 WebSocket [${sessionId}] 请求已取消`)
+      cleanupAndClose()
+      onError(new Error('AbortError'))
+      reject(new Error('AbortError'))
+    })
+
+    // 建立初始连接
+    createConnection()
+  })
 }
 
 // ─── 会话管理 ──────────────────────────────────────────────
 
-/**
- * 清除指定会话（服务端删除消息历史）
- *
- * 调用时机：用户点击"新对话"或"清空当前对话"按钮
- * 注意：即使请求失败也不 throw，前端已同步清除了本地状态
- */
 export async function clearSession(sessionId: string): Promise<void> {
   console.info(`[API] DELETE /session/${sessionId}`)
 
@@ -207,18 +301,6 @@ export async function clearSession(sessionId: string): Promise<void> {
 
 // ─── 健康检查 ──────────────────────────────────────────────
 
-/**
- * 健康检查 — 判断 Agent 服务是否在线
- *
- * 调用时机：
- *   - App.vue 挂载时（onMounted）
- *   - SidebarPanel 每 30 秒轮询一次
- *
- * 注意：健康检查使用原生 fetch（不走 /api 代理），
- * 直接请求 /health 端点，避免被 Axios 拦截器误报错误。
- *
- * @returns true = Agent 在线，false = Agent 离线或网络不可达
- */
 export async function healthCheck(): Promise<boolean> {
   try {
     const res = await fetch('/health')
@@ -234,9 +316,6 @@ export async function healthCheck(): Promise<boolean> {
 
 // ─── 会话列表 & 历史 ──────────────────────────────────────
 
-/**
- * 获取所有会话列表（用于侧边栏展示）
- */
 export async function getSessions(): Promise<SessionMeta[]> {
   console.info('[API] GET /sessions')
 
@@ -246,11 +325,6 @@ export async function getSessions(): Promise<SessionMeta[]> {
   return data
 }
 
-/**
- * 获取指定会话的对话历史（不含 system prompt）
- *
- * 返回时过滤掉 system/tool 消息，只保留 user/assistant 对话
- */
 export async function getHistory(sessionId: string): Promise<ChatMessage[]> {
   console.info(`[API] GET /history/${sessionId}`)
 
@@ -274,9 +348,6 @@ export async function getHistory(sessionId: string): Promise<ChatMessage[]> {
 
 // ─── 用户画像 ──────────────────────────────────────────────
 
-/**
- * 获取用户画像（偏好设置）
- */
 export async function getProfile(): Promise<UserProfile> {
   console.info('[API] GET /profile')
 
@@ -286,11 +357,6 @@ export async function getProfile(): Promise<UserProfile> {
   return data
 }
 
-/**
- * 更新用户画像
- *
- * @param updates - 部分画像字段（只传需要更新的字段）
- */
 export async function updateProfile(updates: Partial<UserProfile>): Promise<UserProfile> {
   console.info('[API] PUT /profile', updates)
 

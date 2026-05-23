@@ -1,34 +1,45 @@
 /**
  * ============================================================
- * cooking-agent 入口文件 — Express HTTP 服务
+ * cooking-agent 入口文件 — Express HTTP + WebSocket 服务
  * ============================================================
  *
  * 功能概述：
- *   提供 HTTP REST API，供前端应用调用做菜智能体。
+ *   提供 HTTP REST API 和 WebSocket 流式接口，供前端应用调用做菜智能体。
  *
  * 接口清单：
- *   GET  /health              - 健康检查（前端轮询判断 Agent 是否在线）
- *   POST /api/chat            - 普通对话（完整返回）
- *   POST /api/chat/stream     - 流式对话（SSE）
- *   POST /api/vision/chat     - 图片识别对话
- *   GET  /api/sessions        - 会话列表
- *   GET  /api/history/:id     - 获取对话历史
- *   DELETE /api/session/:id   - 清除指定会话
- *   GET  /api/profile         - 获取用户画像
- *   PUT  /api/profile         - 更新用户画像
+ *   HTTP:
+ *     GET  /health              - 健康检查（前端轮询判断 Agent 是否在线）
+ *     POST /api/chat            - 普通对话（完整返回）
+ *     POST /api/vision/chat     - 图片识别对话
+ *     GET  /api/sessions        - 会话列表
+ *     GET  /api/history/:id     - 获取对话历史
+ *     DELETE /api/session/:id   - 清除指定会话
+ *     GET  /api/profile         - 获取用户画像
+ *     PUT  /api/profile         - 更新用户画像
+ *   WebSocket:
+ *     /api/chat/ws              - 流式对话（WebSocket）
  *
  * 技术选型：
  *   - Express：轻量 HTTP 框架，路由清晰，middleware 机制完善
  *   - CORS：允许前端跨域访问
- *   - SSE（Server-Sent Events）：服务端推送协议，比 WebSocket 更轻量
+ *   - WebSocket（ws）：双向通信协议，支持流式推送
  *
- * 注意事项：
- *   - SSE 连接会占用一个 HTTP 响应流，直到 res.end() 才释放
- *   - 生产环境建议在 Nginx/网关层配置连接超时
+ * WebSocket 消息格式：
+ *   客户端发送：
+ *     { "type": "chat", "message": "用户消息", "sessionId": "会话ID", "messageId": "消息ID" }
+ *   服务端发送：
+ *     { "type": "chunk", "content": "部分文本" }
+ *     { "type": "done", "content": "完整文本", "sessionId": "xxx" }
+ *     { "type": "error", "error": "错误描述" }
+ *     { "type": "ping" } - 心跳检测
+ *     { "type": "pong" } - 心跳响应
+ *     { "type": "ack", "messageId": "消息ID" } - 消息确认
  */
 
 import express, { type Request, type Response } from 'express'
+import http from 'http'
 import cors from 'cors'
+import WebSocket, { type WebSocket as WebSocketType } from 'ws'
 import 'dotenv/config'
 import { CookingAgent } from './agent'
 import { runMigrations } from './db/migrate'
@@ -39,7 +50,13 @@ import type { ChatRequestBody } from './types'
 // ─── Express 应用初始化 ────────────────────────────────────
 
 const app = express()
-const PORT = Number(process.env.PORT) || 9000
+const server = http.createServer(app)
+const PORT = Number(process.env.PORT) || 9002
+
+// WebSocket 配置常量
+const WS_HEARTBEAT_INTERVAL = 30000 // 心跳间隔 30 秒
+const WS_PING_TIMEOUT = 10000 // ping 超时 10 秒
+const WS_MAX_IDLE_TIME = 600000 // 最大空闲时间 10 分钟
 
 console.log('═══════════════════════════════════════════════')
 console.log('   🍳 厨神小助 Agent 服务启动中…')
@@ -52,7 +69,7 @@ console.log('══════════════════════�
 app.use(cors())
 console.info('[Middleware] ✅ CORS 已启用')
 
-// JSON 请求体解析：限制 100KB 防止大请求攻击
+// JSON 请求体解析：限制 20MB 防止大请求攻击
 app.use(express.json({ limit: '20mb' }))
 console.info('[Middleware] ✅ JSON 解析中间件已启用（限制 20MB）')
 
@@ -125,21 +142,213 @@ async function start(): Promise<void> {
     process.exit(1)
   }
 
+// ─── WebSocket 服务器配置 ──────────────────────────────────
+
+const wss = new WebSocket.Server({ 
+  server, 
+  path: '/api/chat/ws',
+  maxPayload: 10485760, // 10MB 消息大小限制
+})
+
+// 存储活跃的 WebSocket 连接及元数据
+interface ConnectionMetadata {
+  ws: WebSocketType
+  lastActivity: number
+  pingTimeout?: ReturnType<typeof setTimeout>
+}
+const activeConnections = new Map<WebSocketType, ConnectionMetadata>()
+
+/**
+ * 发送 ping 心跳
+ */
+function sendPing(ws: WebSocketType): void {
+  if (ws.readyState !== WebSocket.OPEN) return
+  
+  const metadata = activeConnections.get(ws)
+  if (!metadata) return
+
+  // 设置 ping 超时
+  metadata.pingTimeout = setTimeout(() => {
+    console.warn('[WebSocket] ⚠️ ping 超时，强制关闭连接')
+    ws.terminate()
+  }, WS_PING_TIMEOUT)
+
+  ws.send(JSON.stringify({ type: 'ping' }))
+}
+
+/**
+ * 清理连接资源
+ */
+function cleanupConnection(ws: WebSocketType): void {
+  const metadata = activeConnections.get(ws)
+  if (metadata) {
+    if (metadata.pingTimeout) {
+      clearTimeout(metadata.pingTimeout)
+    }
+    activeConnections.delete(ws)
+  }
+}
+
+// 定期发送心跳（每 30 秒）
+const heartbeatInterval = setInterval(() => {
+  const now = Date.now()
+  
+  activeConnections.forEach((metadata, ws) => {
+    // 检查空闲超时
+    if (now - metadata.lastActivity > WS_MAX_IDLE_TIME) {
+      console.info('[WebSocket] ⏰ 连接空闲超时，自动断开')
+      ws.close(1000, 'Idle timeout')
+      return
+    }
+
+    // 发送心跳
+    sendPing(ws)
+  })
+}, WS_HEARTBEAT_INTERVAL)
+
+wss.on('connection', (ws: WebSocketType) => {
+  console.info('[WebSocket] 🔌 新连接建立')
+
+  // 初始化连接元数据
+  activeConnections.set(ws, {
+    ws,
+    lastActivity: Date.now(),
+  })
+
+  ws.on('message', async (data: WebSocket.Data) => {
+    // 更新活动时间
+    const metadata = activeConnections.get(ws)
+    if (metadata) {
+      metadata.lastActivity = Date.now()
+    }
+
+    let parsedData: { 
+      type: string; 
+      message?: string; 
+      sessionId?: string;
+      messageId?: string;
+    }
+
+    try {
+      parsedData = JSON.parse(data.toString())
+    } catch {
+      console.warn('[WebSocket] ⚠️ 消息解析失败')
+      ws.send(JSON.stringify({ type: 'error', error: '无效的消息格式' }))
+      return
+    }
+
+    // 心跳响应
+    if (parsedData.type === 'pong') {
+      console.debug('[WebSocket] 🏓 收到 pong 响应')
+      // 清除 ping 超时定时器
+      if (metadata?.pingTimeout) {
+        clearTimeout(metadata.pingTimeout)
+        metadata.pingTimeout = undefined
+      }
+      return
+    }
+
+    if (parsedData.type !== 'chat') {
+      console.warn('[WebSocket] ⚠️ 未知消息类型:', parsedData.type)
+      ws.send(JSON.stringify({ type: 'error', error: '未知消息类型' }))
+      return
+    }
+
+    const { message, sessionId = 'default', messageId } = parsedData
+
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      console.warn('[WebSocket] ⚠️ 参数校验失败：message 为空或无效')
+      ws.send(JSON.stringify({ type: 'error', error: '请提供有效的 message 字段' }))
+      return
+    }
+
+    // 发送消息确认（ACK）
+    if (messageId) {
+      ws.send(JSON.stringify({ type: 'ack', messageId }))
+    }
+
+    console.info(`[WebSocket] 📥 收到消息 [${sessionId}]：${message.slice(0, 50)}…`)
+
+    const abortController = new AbortController()
+    let finished = false
+    let hasStreamed = false
+
+    // 监听连接关闭事件
+    const handleClose = () => {
+      if (!finished && hasStreamed) {
+        console.info(`[WebSocket] 🛑 客户端断开连接，触发中止 [${sessionId}]`)
+        abortController.abort()
+      }
+    }
+
+    ws.once('close', handleClose)
+
+    try {
+      await agent.chatStream(
+        message.trim(),
+        sessionId,
+        (chunk) => {
+          hasStreamed = true
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'chunk', content: chunk }))
+          }
+        },
+        (full) => {
+          finished = true
+          ws.removeListener('close', handleClose)
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'done', content: full, sessionId }))
+            console.info(`[WebSocket] ✅ 传输完成 [${sessionId}]`)
+          }
+        },
+        abortController.signal,
+      )
+    } catch (err) {
+      finished = true
+      ws.removeListener('close', handleClose)
+      console.error(`[WebSocket] ❌ 出错 [${sessionId}]：${(err as Error).message}`)
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'error', error: (err as Error).message }))
+      }
+    }
+  })
+
+  ws.on('close', (code: number, reason: string) => {
+    cleanupConnection(ws)
+    console.info(`[WebSocket] 🔌 连接已关闭 (${code}): ${reason || '正常关闭'}`)
+  })
+
+  ws.on('error', (error) => {
+    cleanupConnection(ws)
+    console.error('[WebSocket] ❌ 连接错误：', error)
+  })
+
+  // 发送欢迎消息
+  ws.send(JSON.stringify({ type: 'welcome', message: '连接成功，准备接收消息' }))
+})
+
+// 服务器关闭时清理
+process.on('SIGINT', () => {
+  clearInterval(heartbeatInterval)
+  wss.clients.forEach((client) => {
+    client.close(1001, 'Server shutting down')
+  })
+  server.close(() => {
+    console.info('[Server] 🛑 服务已关闭')
+    process.exit(0)
+  })
+})
+
+console.info('[WebSocket] ✅ WebSocket 服务器已启用（路径：/api/chat/ws）')
+console.info('[WebSocket] ⚡ 心跳检测已启用（间隔：30s，超时：10s）')
+console.info('[WebSocket] ⏰ 空闲超时已启用（10分钟）')
+
 // ─── 路由定义 ──────────────────────────────────────────────
 
 /**
  * GET /health
  * ────────────────────────────────────────────────────────────
  * 健康检查接口。
- *
- * 用途：
- *   - 前端每 30 秒轮询一次，判断 Agent 服务是否在线
- *   - 负载均衡器/容器编排探测服务可用性
- *
- * 请求参数：无
- *
- * 返回示例：
- *   { "status": "ok", "agent": "厨神小助", "version": "1.0.0" }
  */
 app.get('/health', (_req: Request, res: Response) => {
   console.debug('[Route] GET /health 被调用')
@@ -148,6 +357,7 @@ app.get('/health', (_req: Request, res: Response) => {
     agent: '厨神小助',
     version: '1.0.0',
     timestamp: new Date().toISOString(),
+    wsConnections: activeConnections.size,
   })
 })
 
@@ -155,24 +365,6 @@ app.get('/health', (_req: Request, res: Response) => {
  * POST /api/chat
  * ────────────────────────────────────────────────────────────
  * 普通对话接口（非流式，一次性返回完整结果）。
- *
- * 适用场景：
- *   - 简单问答（不需要打字机效果）
- *   - 客户端不支持 SSE（如某些低版本浏览器）
- *
- * 请求 Body：
- *   {
- *     "message": "string",   // 必填，用户消息
- *     "sessionId": "string"  // 选填，默认 'default'
- *   }
- *
- * 返回示例：
- *   {
- *     "success": true,
- *     "message": "这是 AI 回复的完整内容…",
- *     "sessionId": "123456_abc",
- *     "usage": { "prompt_tokens": 120, "completion_tokens": 85, "total_tokens": 205 }
- *   }
  */
 app.post(
   '/api/chat',
@@ -181,7 +373,6 @@ app.post(
 
     console.info(`[Route] POST /api/chat [${sessionId}] 收到请求`)
 
-    // ── 参数校验 ──
     if (!message || typeof message !== 'string' || !message.trim()) {
       console.warn(`[Route] ⚠️  参数校验失败：message 为空或无效`)
       res.status(400).json({ error: '请提供有效的 message 字段' })
@@ -189,13 +380,11 @@ app.post(
     }
 
     try {
-      // ── 调用 Agent ──
       const result = await agent.chat(message.trim(), sessionId)
 
       console.info(`[Route] ✅ /api/chat [${sessionId}] 返回成功`)
       res.json(result)
     } catch (err) {
-      // 统一错误处理：返回 500 并附带错误信息（线上可关闭 detail）
       console.error(`[Route] ❌ /api/chat [${sessionId}] 调用出错：`, err)
       res.status(500).json({
         error: '调用 DeepSeek API 失败',
@@ -206,165 +395,9 @@ app.post(
 )
 
 /**
- * POST /api/chat/stream
- * ────────────────────────────────────────────────────────────
- * 流式对话接口（SSE — Server-Sent Events）。
- *
- * 与 /api/chat 的区别：
- *   - 返回 Content-Type 为 text/event-stream
- *   - 响应体是多个 SSE 事件，直到最后一个事件才 res.end()
- *   - 适合长文本回复，前端可实现打字机效果
- *
- * SSE 事件格式：
- *   event: chunk
- *   data: {"content": "部分文本"}
- *
- *   event: done
- *   data: {"content": "完整文本", "sessionId": "xxx"}
- *
- *   event: error
- *   data: {"error": "错误描述"}
- */
-app.post(
-  '/api/chat/stream',
-  async (req: Request<object, object, ChatRequestBody>, res: Response) => {
-    const { message, sessionId = 'default' } = req.body
-
-    console.info(`[Route] POST /api/chat/stream [${sessionId}] 建立 SSE 连接`)
-
-    // ── 参数校验 ──
-    if (!message || typeof message !== 'string' || !message.trim()) {
-      console.warn(`[Route] ⚠️  参数校验失败：message 为空或无效`)
-      res.status(400).json({ error: '请提供有效的 message 字段' })
-      return
-    }
-
-    // ── 设置 SSE 响应头 ──
-    // Content-Type：告知客户端这是 SSE 流，不是普通文本
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
-    // Cache-Control：禁止缓存，确保浏览器实时接收数据
-    res.setHeader('Cache-Control', 'no-cache')
-    // Connection：保持连接不断开
-    res.setHeader('Connection', 'keep-alive')
-    // X-Accel-Buffering：Nginx 反向代理时禁用缓冲（否则会等 SSE 结束后才返回）
-    res.setHeader('X-Accel-Buffering', 'no')
-    // 立即发送 HTTP 头（SSE 必须先 flush，才能开始发送 body）
-    res.flushHeaders()
-
-    console.info(`[Route] 🔗 SSE 头已发送，等待 Agent 处理…`)
-
-    /**
-     * SSE 事件发送工具函数
-     *
-     * event 字段：客户端通过 EventSource.addEventListener(event, handler) 监听
-     * data 字段：JSON 序列化后的数据
-     * \n\n：SSE 协议规定的消息分隔符
-     */
-    const sendEvent = (event: string, data: object): void => {
-      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
-    }
-
-    /**
-     * 中止信号控制器 — 串联前后端的中断链路
-     *
-     * 场景：
-     *   ① 用户在前端点击"停止生成" → AbortController.abort() → signal 置位
-     *   ② 客户端 TCP 连接意外断开 → req.on('close') → abort()
-     *
-     * 信号沿以下路径传播：
-     *   index.ts → agent.chatStream(signal) → llm.chatCompletionStream(signal)
-     *   → for await (const chunk of stream) { if (signal.aborted) break }
-     */
-    const abortController = new AbortController()
-
-    /**
-     * finished — 正常完成标记
-     *   在 onDone 回调中置为 true，防止 close 事件误触发中止
-     *
-     * hasStreamed — 已开始流式传输标记
-     *   防止 Vite 代理在 SSE 连接建立初期的瞬时 close 事件误触发中止
-     *   只有在至少一个 chunk 已发送给客户端后，close 才被视为"用户主动断开"
-     *
-     * writableEnded — Express 响应结束标记
-     *   res.end() 后底层 socket 可能延迟关闭，此时 close 事件不应再处理
-     */
-    let finished = false
-    let hasStreamed = false
-
-    req.on('close', () => {
-      if (!finished && !res.writableEnded && hasStreamed) {
-        console.info(`[Route] 🔌 SSE [${sessionId}] 客户端断开连接（已流式 ${hasStreamed ? '是' : '否'}），触发中止`)
-        abortController.abort()
-      } else if (!hasStreamed) {
-        console.info(`[Route] 🔌 SSE [${sessionId}] 连接建立阶段 close 事件，忽略（hasStreamed=false）`)
-      } else if (finished) {
-        console.info(`[Route] 🔌 SSE [${sessionId}] 正常完成后的 close 事件，忽略`)
-      }
-    })
-
-    /**
-     * try 块内调用 agent.chatStream()，正常的完成/中止均由内部回调处理：
-     *   - onChunk → sendEvent('chunk') → 前端逐 token 显示
-     *   - onDone  → sendEvent('done')  → 前端停止打字机效果
-     *
-     * catch 块捕获两种异常：
-     *   ① Agent 内部未处理的异常（如 JSON 解析失败、持久化错误）
-     *   ② LLM API 调用异常（网络超时、限流等）
-     *   均通过 SSE error 事件告知前端，前端展示友好错误提示
-     */
-    try {
-      await agent.chatStream(
-        message.trim(),
-        sessionId,
-        (chunk) => {
-          hasStreamed = true
-          if (!res.writableEnded) {
-            sendEvent('chunk', { content: chunk })
-          }
-        },
-        (full) => {
-          finished = true
-          if (!res.writableEnded) {
-            sendEvent('done', { content: full, sessionId })
-            console.info(`[Route] ✅ SSE [${sessionId}] 传输完成`)
-            res.end()
-          }
-        },
-        abortController.signal,
-      )
-    } catch (err) {
-      finished = true
-      console.error(`[Route] ❌ SSE [${sessionId}] 出错：${(err as Error).message}`)
-      if (!res.writableEnded) {
-        sendEvent('error', { error: (err as Error).message })
-        res.end()
-      }
-    }
-  },
-)
-
-/**
  * POST /api/vision/chat
  * ────────────────────────────────────────────────────────────
  * 图片识别对话接口。
- *
- * 用途：
- *   - 用户上传食材/菜品图片，AI 识别并给出做菜建议
- *   - 需要配置 VISION_API_KEY（或 OPENAI_API_KEY）才能使用
- *
- * 请求 Body：
- *   {
- *     "image": "base64编码的图片数据",
- *     "message": "可选的文字描述",
- *     "sessionId": "会话ID（可选）"
- *   }
- *
- * 返回示例：
- *   {
- *     "success": true,
- *     "content": "我看到了番茄、鸡蛋和青椒…你可以做…",
- *     "usage": { "prompt_tokens": 500, "completion_tokens": 200, "total_tokens": 700 }
- *   }
  */
 app.post(
   '/api/vision/chat',
@@ -396,10 +429,7 @@ app.post(
 /**
  * GET /api/sessions
  * ────────────────────────────────────────────────────────────
- * 获取所有会话列表（用于前端侧边栏展示历史对话）。
- *
- * 返回示例：
- *   [{ "id": "xxx", "title": "红烧肉怎么做", "created_at": 123, "updated_at": 456 }]
+ * 获取所有会话列表。
  */
 app.get('/api/sessions', async (_req: Request, res: Response) => {
   console.debug('[Route] GET /api/sessions')
@@ -410,11 +440,7 @@ app.get('/api/sessions', async (_req: Request, res: Response) => {
 /**
  * GET /api/history/:sessionId
  * ────────────────────────────────────────────────────────────
- * 获取指定会话的对话历史（不含 system prompt）。
- *
- * 用途：
- *   - 前端加载页面时恢复历史会话
- *   - 调试时查看服务端存储的对话内容
+ * 获取指定会话的对话历史。
  */
 app.get(
   '/api/history/:sessionId',
@@ -431,11 +457,7 @@ app.get(
 /**
  * DELETE /api/session/:sessionId
  * ────────────────────────────────────────────────────────────
- * 清除指定会话，开启新对话。
- *
- * 用途：
- *   - 用户点击"清空对话"或"新对话"按钮时调用
- *   - 服务端删除该 sessionId 的所有消息历史
+ * 清除指定会话。
  */
 app.delete(
   '/api/session/:sessionId',
@@ -451,29 +473,12 @@ app.delete(
 
 // ─── 用户画像接口 ──────────────────────────────────────────
 
-/**
- * GET /api/profile
- * 获取用户画像（偏好设置）。
- */
 app.get('/api/profile', async (_req: Request, res: Response) => {
   console.debug('[Route] GET /api/profile')
   const profile = await userProfileRepo.getOrCreate()
   res.json(profile)
 })
 
-/**
- * PUT /api/profile
- * 更新用户画像。
- *
- * 请求 Body：
- *   {
- *     "allergies": ["花生", "海鲜"],
- *     "diet_type": "生酮",
- *     "skill_level": "beginner",
- *     "disliked": ["香菜"],
- *     "calorie_goal": 1800
- *   }
- */
 app.put('/api/profile', async (req: Request, res: Response) => {
   console.info('[Route] PUT /api/profile')
   const { allergies, diet_type, skill_level, disliked, calorie_goal } = req.body
@@ -491,13 +496,10 @@ app.put('/api/profile', async (req: Request, res: Response) => {
 
 // ─── 全局错误处理 ──────────────────────────────────────────
 
-// Express 路由未匹配到时触发（404）
 app.use((_req: Request, res: Response) => {
   res.status(404).json({ error: '接口不存在' })
 })
 
-// 统一错误中间件（Express 会将 thrown Error 传递到这里）
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((err: Error, _req: Request, res: Response, _next: express.NextFunction) => {
   console.error('[GlobalError] 未捕获的错误：', err)
   res.status(500).json({ error: '服务器内部错误', detail: err.message })
@@ -505,7 +507,7 @@ app.use((err: Error, _req: Request, res: Response, _next: express.NextFunction) 
 
 // ─── 服务启动 ──────────────────────────────────────────────
 
-  app.listen(PORT, () => {
+  server.listen(PORT, () => {
     console.log('')
     console.log('═══════════════════════════════════════════════')
     console.log(`   🍳 厨神小助 Agent 服务已启动！`)
@@ -514,7 +516,7 @@ app.use((err: Error, _req: Request, res: Response, _next: express.NextFunction) 
     console.log('📋 可用接口：')
     console.log(`   GET    /health               健康检查`)
     console.log(`   POST   /api/chat             普通对话`)
-    console.log(`   POST   /api/chat/stream      流式对话（SSE）`)
+    console.log(`   WS     /api/chat/ws          流式对话（WebSocket）`)
     console.log(`   POST   /api/vision/chat      图片识别对话`)
     console.log(`   GET    /api/sessions         会话列表`)
     console.log(`   GET    /api/history/:id      获取对话历史`)

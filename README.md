@@ -12,7 +12,7 @@
 
 ```
 cooking-ai/
-├── cooking-agent/          ← Node.js Agent 后端（TypeScript，端口 9000）
+├── cooking-agent/          ← Node.js Agent 后端（TypeScript，端口 9002）
 │   ├── src/
 │   │   ├── index.ts        ← Express 服务入口
 │   │   ├── agent.ts        ← CookingAgent 核心（ReAct + Function Calling）
